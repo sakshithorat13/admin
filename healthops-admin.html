@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>HealthOps — Admin Portal</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --g:#1D9E75;--gd:#0F6E56;--gp:#085041;--gl:#E1F5EE;--gm:#9FE1CB;
+  --bg:#F0F4F2;--su:#FFFFFF;--su2:#F7FAF8;
+  --bd:#DDE8E4;--bd2:#C4D6D0;
+  --tx:#0C1C18;--t2:#4A6560;--t3:#90ADAA;
+  --rd:#DC3545;--rb:#FEF0F0;
+  --am:#D97706;--ab:#FFFBEB;
+  --bl:#2563EB;--bb:#EFF6FF;
+  --r:12px;--rs:8px;--rx:5px;
+  --sh:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+  --shm:0 4px 16px rgba(0,0,0,.08);
+}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+button{font-family:inherit;cursor:pointer;border:none;outline:none;background:none}
+input,select,textarea{font-family:inherit;font-size:14px;outline:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.ani{animation:fadeIn .2s ease}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="module">
+import{initializeApp}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import{getAuth,signInWithEmailAndPassword,signOut,onAuthStateChanged}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import{getFirestore,collection,doc,getDoc,getDocs,addDoc,deleteDoc,updateDoc,query,where,orderBy,serverTimestamp,onSnapshot}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const app=initializeApp({
+  apiKey:"AIzaSyDMGHzqfzfRD_VvPqQh6NwecLGLxqKjskU",
+  authDomain:"healthops-cdec4.firebaseapp.com",
+  projectId:"healthops-cdec4",
+  storageBucket:"healthops-cdec4.firebasestorage.app",
+  messagingSenderId:"119682739179",
+  appId:"1:119682739179:web:healthops_admin"
+});
+const auth=getAuth(app);
+const db=getFirestore(app);
+
+/* ─── helpers ─────────────────────────────────── */
+const fmtDate=ts=>{
+  if(!ts)return"—";
+  const d=ts.toDate?ts.toDate():new Date(ts);
+  return d.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
+};
+const pColor=p=>({
+  high:{bg:"#FEF0F0",tx:"#B91C1C",dot:"#DC3545"},
+  medium:{bg:"#FFFBEB",tx:"#92400E",dot:"#D97706"},
+  low:{bg:"#EFF6FF",tx:"#1E40AF",dot:"#2563EB"},
+}[p]||{bg:"#F3F4F6",tx:"#374151",dot:"#6B7280"});
+const h=(tag,css,html,attrs={})=>{
+  const e=document.createElement(tag);
+  if(css)e.style.cssText=css;
+  if(html)e.innerHTML=html;
+  Object.entries(attrs).forEach(([k,v])=>k!=="style"&&k!=="html"&&e.setAttribute(k,v));
+  return e;
+};
+const q=(id)=>document.getElementById(id);
+
+/* ─── state ───────────────────────────────────── */
+let S={
+  user:null,role:null,staff:[],tasks:[],medicines:[],
+  loading:true,authLoading:false,loginErr:"",
+  view:"dashboard",
+  modal:false,mForm:{title:"",to:"",patient:"",priority:"medium",notes:""},mErr:"",mSaving:false,
+  fStaff:"all",fPriority:"all",fStatus:"all",
+  toast:null,confirmDel:null,
+};
+let unsubTasks=null;
+const R=()=>{const root=document.getElementById("root");root.innerHTML="";root.appendChild(build());};
+
+/* ─── firebase ops ────────────────────────────── */
+onAuthStateChanged(auth,async user=>{
+  if(user){
+    const snap=await getDoc(doc(db,"users",user.uid));
+    const data=snap.exists()?snap.data():{};
+    S.role=data.role||"staff";
+    if(S.role!=="admin"){
+      await signOut(auth);
+      S.loginErr="Access denied. This account is not an admin.";
+      S.user=null;S.loading=false;
+    }else{
+      S.user=user;S.loginErr="";
+      await loadStaff();
+      subscribeToTasks();
+      S.loading=false;
+    }
+  }else{
+    S.user=null;S.role=null;S.loading=false;
+    if(unsubTasks){unsubTasks();unsubTasks=null;}
+  }
+  R();
+});
+
+async function doLogin(email,pass){
+  S.authLoading=true;S.loginErr="";R();
+  try{await signInWithEmailAndPassword(auth,email,pass);}
+  catch(e){
+    S.authLoading=false;
+    S.loginErr=["auth/invalid-credential","auth/user-not-found","auth/wrong-password"].includes(e.code)
+      ?"Invalid email or password.":e.message;
+    R();
+  }
+}
+async function doLogout(){
+  await signOut(auth);
+  S={...S,user:null,role:null,staff:[],tasks:[],view:"dashboard"};
+  R();
+}
+async function loadStaff(){
+  const snap=await getDocs(query(collection(db,"users"),where("role","==","staff")));
+  S.staff=snap.docs.map(d=>({id:d.id,...d.data()}));
+}
+function subscribeToTasks(){
+  if(unsubTasks)unsubTasks();
+  unsubTasks=onSnapshot(query(collection(db,"tasks"),orderBy("createdAt","desc")),snap=>{
+    S.tasks=snap.docs.map(d=>({id:d.id,...d.data()}));
+    if(!S.loading)R();
+  });
+}
+async function saveTask(){
+  const{title,to,patient,priority,notes}=S.mForm;
+  if(!title.trim()){S.mErr="Task title is required.";R();return;}
+  if(!to){S.mErr="Please select a staff member.";R();return;}
+  const sm=S.staff.find(s=>s.id===to);
+  S.mSaving=true;S.mErr="";R();
+  try{
+    await addDoc(collection(db,"tasks"),{
+      title:title.trim(),assignedTo:to,
+      assignedToEmail:sm?.email||"",
+      patient:patient.trim(),priority,
+      notes:notes.trim(),isDone:false,
+      createdAt:serverTimestamp(),
+      createdBy:S.user.email,
+    });
+    S.modal=false;
+    S.mForm={title:"",to:"",patient:"",priority:"medium",notes:""};
+    toast("Task assigned successfully!","success");
+  }catch(e){S.mErr="Failed: "+e.message;}
+  S.mSaving=false;R();
+}
+async function delTask(id){
+  await deleteDoc(doc(db,"tasks",id));
+  S.confirmDel=null;
+  toast("Task deleted.","info");
+}
+async function toggleDone(id,cur){
+  await updateDoc(doc(db,"tasks",id),{isDone:!cur});
+}
+function toast(msg,type="success"){
+  S.toast={msg,type};R();
+  setTimeout(()=>{S.toast=null;R();},3000);
+}
+
+/* ─── builder ─────────────────────────────────── */
+function build(){
+  if(S.loading)return buildLoading();
+  if(!S.user)return buildAuth();
+  return buildApp();
+}
+
+/* ── loading ── */
+function buildLoading(){
+  const w=h("div","min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--gp)");
+  w.innerHTML=`<div style="text-align:center">
+    <div style="width:44px;height:44px;border:3px solid rgba(255,255,255,0.15);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px"></div>
+    <p style="color:rgba(255,255,255,0.6);font-size:13px">Loading HealthOps…</p>
+  </div>`;
+  return w;
+}
+
+/* ── auth ── */
+function buildAuth(){
+  const w=h("div","min-height:100vh;display:flex");
+
+  /* left panel */
+  const left=h("div","flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:3rem;background:var(--gp)");
+  left.innerHTML=`
+    <div style="max-width:340px;width:100%">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:40px">${logo(40)}<div>
+        <div style="color:#fff;font-size:20px;font-weight:700;letter-spacing:-0.4px">HealthOps</div>
+        <div style="color:var(--gm);font-size:12px;font-weight:500;letter-spacing:0.5px;text-transform:uppercase">Admin Portal</div>
+      </div></div>
+      <h1 style="color:#fff;font-size:26px;font-weight:700;line-height:1.3;margin-bottom:14px">Manage your<br/>healthcare operations</h1>
+      <p style="color:rgba(255,255,255,0.55);font-size:14px;line-height:1.75;margin-bottom:32px">Assign tasks to staff, monitor duty progress, and keep your ward running smoothly from one centralised portal.</p>
+      <div style="display:flex;flex-direction:column;gap:12px">
+        ${feat("Assign tasks to staff in real time")}
+        ${feat("Monitor completion across all wards")}
+        ${feat("Manage staff members and workloads")}
+      </div>
+    </div>`;
+
+  /* right panel */
+  const right=h("div","flex:1;display:flex;align-items:center;justify-content:center;padding:2rem;background:#fff");
+  const card=h("div","width:100%;max-width:400px");
+
+  card.innerHTML=`
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:36px">${logo(32)}
+      <span style="font-size:17px;font-weight:700;color:var(--tx)">HealthOps <span style="color:var(--t3);font-weight:400">Admin</span></span>
+    </div>
+    <h2 style="font-size:22px;font-weight:700;margin-bottom:6px;color:var(--tx)">Welcome back</h2>
+    <p style="color:var(--t2);margin-bottom:28px;font-size:14px">Sign in with your admin credentials</p>
+    ${S.loginErr?`<div style="background:#FEF0F0;border:1px solid #FECACA;color:#B91C1C;padding:10px 14px;border-radius:var(--rs);margin-bottom:16px;font-size:13px;display:flex;align-items:center;gap:8px"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6" stroke="#B91C1C" stroke-width="1.3"/><path d="M7 4v3M7 9.5h.01" stroke="#B91C1C" stroke-width="1.3" stroke-linecap="round"/></svg>${S.loginErr}</div>`:""}
+    <div style="margin-bottom:16px">
+      <label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">Email address</label>
+      <input id="lEmail" type="email" placeholder="admin@hospital.com" autocomplete="email"
+        style="width:100%;padding:11px 14px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:14px;color:var(--tx);background:#fff;transition:border-color .15s"
+        onfocus="this.style.borderColor='var(--g)'" onblur="this.style.borderColor='var(--bd2)'"/>
+    </div>
+    <div style="margin-bottom:24px">
+      <label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">Password</label>
+      <input id="lPass" type="password" placeholder="••••••••" autocomplete="current-password"
+        style="width:100%;padding:11px 14px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:14px;color:var(--tx);background:#fff;transition:border-color .15s"
+        onfocus="this.style.borderColor='var(--g)'" onblur="this.style.borderColor='var(--bd2)'"/>
+    </div>`;
+
+  const btn=h("button",`width:100%;padding:13px;background:var(--g);color:#fff;font-size:15px;font-weight:600;border-radius:var(--rs);transition:background .15s;opacity:${S.authLoading?.7:1};cursor:${S.authLoading?"not-allowed":"pointer"}`);
+  btn.textContent=S.authLoading?"Signing in…":"Sign in";
+  btn.onmouseover=()=>{if(!S.authLoading)btn.style.background="var(--gd)";};
+  btn.onmouseout=()=>{btn.style.background="var(--g)";};
+  btn.onclick=()=>{
+    if(S.authLoading)return;
+    doLogin(q("lEmail")?.value||"",q("lPass")?.value||"");
+  };
+  card.appendChild(btn);
+
+  const hint=h("p","margin-top:18px;text-align:center;font-size:12px;color:var(--t3)");
+  hint.textContent='Only Firestore users with role = "admin" can sign in.';
+  card.appendChild(hint);
+  right.appendChild(card);
+  w.appendChild(left);w.appendChild(right);
+
+  setTimeout(()=>{
+    ["lEmail","lPass"].forEach(id=>{
+      const inp=q(id);
+      if(inp)inp.addEventListener("keydown",e=>{if(e.key==="Enter")btn.click();});
+    });
+  },50);
+  return w;
+}
+const feat=t=>`<div style="display:flex;align-items:center;gap:10px">
+  <div style="width:20px;height:20px;border-radius:50%;background:rgba(255,255,255,0.12);display:flex;align-items:center;justify-content:center;flex-shrink:0">
+    <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M2 5l2 2 4-4" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </div>
+  <span style="color:rgba(255,255,255,0.7);font-size:14px">${t}</span>
+</div>`;
+
+/* ── main app ── */
+function buildApp(){
+  const w=h("div","display:flex;min-height:100vh");
+  w.appendChild(buildSidebar());
+  const main=h("div","flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden");
+  main.appendChild(buildTopbar());
+  const content=h("div","flex:1;overflow-y:auto;padding:28px");
+  content.appendChild(buildView());
+  main.appendChild(content);
+  w.appendChild(main);
+  if(S.modal)w.appendChild(buildModal());
+  if(S.confirmDel)w.appendChild(buildConfirm());
+  if(S.toast)w.appendChild(buildToast());
+  return w;
+}
+
+/* ── sidebar ── */
+function buildSidebar(){
+  const s=h("div","width:236px;background:var(--gp);display:flex;flex-direction:column;flex-shrink:0");
+
+  const lh=h("div","padding:22px 18px 18px;border-bottom:1px solid rgba(255,255,255,0.08)");
+  lh.innerHTML=`<div style="display:flex;align-items:center;gap:10px">${logo(34)}<div>
+    <div style="color:#fff;font-size:15px;font-weight:700">HealthOps</div>
+    <div style="color:var(--gm);font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:0.5px">Admin Portal</div>
+  </div></div>`;
+  s.appendChild(lh);
+
+  const nav=h("nav","flex:1;padding:14px 10px");
+  [
+    {id:"dashboard",ic:icGrid(),lb:"Dashboard"},
+    {id:"tasks",ic:icCheck(),lb:"All Tasks"},
+    {id:"staff",ic:icUsers(),lb:"Staff Members"},
+    {id:"medicine",ic:icPill(),lb:"Medicine Stock"}
+  ].forEach(({id,ic,lb})=>{
+    const active=S.view===id;
+    const btn=h("button",`width:100%;display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--rs);margin-bottom:2px;font-size:14px;font-weight:500;transition:all .15s;text-align:left;background:${active?"rgba(255,255,255,0.13)":"transparent"};color:${active?"#fff":"rgba(255,255,255,0.55)"}`);
+    btn.innerHTML=ic+`<span>${lb}</span>`;
+    if(active){const ind=h("div","width:3px;height:16px;background:var(--gm);border-radius:99px;margin-left:auto");btn.appendChild(ind);}
+    btn.onmouseover=()=>{if(!active)btn.style.background="rgba(255,255,255,0.07)";};
+    btn.onmouseout=()=>{if(!active)btn.style.background="transparent";};
+    btn.onclick=()=>{
+      S.view=id;
+      if (id === "medicine") loadMedicines(); // Ensure loadMedicines is called
+      R();
+    };
+    nav.appendChild(btn);
+  });
+  s.appendChild(nav);
+
+  const ft=h("div","padding:14px 10px;border-top:1px solid rgba(255,255,255,0.08)");
+  const init=(S.user?.email||"A")[0].toUpperCase();
+  ft.innerHTML=`<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--rs);margin-bottom:4px">
+    <div style="width:32px;height:32px;border-radius:50%;background:var(--g);display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;font-weight:700;flex-shrink:0">${init}</div>
+    <div style="flex:1;min-width:0">
+      <div style="color:#fff;font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${S.user?.email}</div>
+      <div style="color:var(--gm);font-size:11px">Administrator</div>
+    </div>
+  </div>`;
+  const lo=h("button","width:100%;display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:var(--rs);color:rgba(255,255,255,0.45);font-size:13px;font-weight:500;transition:all .15s");
+  lo.innerHTML=icLogout()+"<span>Sign out</span>";
+  lo.onmouseover=()=>{lo.style.background="rgba(255,255,255,0.07)";lo.style.color="#fff";};
+  lo.onmouseout=()=>{lo.style.background="transparent";lo.style.color="rgba(255,255,255,0.45)";};
+  lo.onclick=doLogout;
+  ft.appendChild(lo);
+  s.appendChild(ft);
+  return s;
+}
+
+/* ── topbar ── */
+function buildTopbar(){
+  const titles={dashboard:"Dashboard",tasks:"All Tasks",staff:"Staff Members",medicine:"Medicine Stock"};
+  const t=h("div","background:var(--su);border-bottom:1px solid var(--bd);padding:0 28px;height:60px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0");
+  t.innerHTML=`<h1 style="font-size:16px;font-weight:700;color:var(--tx)">${titles[S.view]||""}</h1>`;
+  const ab=h("button","display:flex;align-items:center;gap:6px;padding:8px 16px;background:var(--g);color:#fff;border-radius:var(--rs);font-size:13px;font-weight:600;transition:background .15s");
+  ab.innerHTML=`<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1v11M1 6.5h11" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg> Assign Task`;
+  ab.onmouseover=()=>ab.style.background="var(--gd)";
+  ab.onmouseout=()=>ab.style.background="var(--g)";
+  ab.onclick=()=>{S.modal=true;R();};
+  t.appendChild(ab);
+  return t;
+}
+
+/* ── views ── */
+function buildView(){
+  const w=h("div","");w.classList.add("ani");
+  if(S.view==="dashboard")w.appendChild(vDashboard());
+  else if(S.view==="tasks")w.appendChild(vTasks());
+  else if(S.view==="staff")w.appendChild(vStaff());
+  else if(S.view==="medicine")w.appendChild(buildMedicineTab());
+  return w;
+}
+
+/* dashboard */
+function vDashboard(){
+  const frag=document.createDocumentFragment();
+  const total=S.tasks.length,done=S.tasks.filter(t=>t.isDone).length;
+  const pct=total?Math.round(done/total*100):0;
+  const hi=S.tasks.filter(t=>!t.isDone&&t.priority==="high").length;
+
+  /* stat strip */
+  const stats=h("div","display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:24px");
+  [
+    {lb:"Total Tasks",val:total,c:"var(--g)"},
+    {lb:"Completed",val:done,c:"#2563EB"},
+    {lb:"Pending",val:total-done,c:"var(--am)"},
+    {lb:"High Priority",val:hi,c:"var(--rd)"},
+    {lb:"Staff Members",val:S.staff.length,c:"#7C3AED"},
+    {lb:"Completion",val:pct+"%",c:"var(--gd)"},
+  ].forEach(({lb,val,c})=>{
+    const sc=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);padding:18px 20px;transition:box-shadow .15s");
+    sc.onmouseover=()=>sc.style.boxShadow="var(--shm)";
+    sc.onmouseout=()=>sc.style.boxShadow="none";
+    sc.innerHTML=`<div style="font-size:11px;font-weight:600;color:var(--t3);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:8px">${lb}</div>
+    <div style="font-size:28px;font-weight:700;color:${c}">${val}</div>`;
+    stats.appendChild(sc);
+  });
+  frag.appendChild(stats);
+
+  /* two-col grid */
+  const grid=h("div","display:grid;grid-template-columns:1fr 1fr;gap:20px");
+
+  /* recent tasks */
+  const rc=sectionCard("Recent Tasks",5);
+  const recent=S.tasks.slice(0,6);
+  if(!recent.length){rc.appendChild(empty("No tasks yet"));}
+  else recent.forEach(t=>{
+    const c=pColor(t.priority||"medium");
+    const row=h("div","display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--bd)");
+    row.innerHTML=`<div style="width:8px;height:8px;border-radius:50%;background:${c.dot};flex-shrink:0"></div>
+    <div style="flex:1;min-width:0">
+      <div style="font-size:13px;font-weight:500;color:${t.isDone?"var(--t3)":"var(--tx)"};text-decoration:${t.isDone?"line-through":"none"};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${t.title}</div>
+      <div style="font-size:11px;color:var(--t3)">${t.assignedToEmail||"Unassigned"}</div>
+    </div>
+    <div style="font-size:11px;padding:2px 8px;border-radius:99px;background:${t.isDone?"var(--gl)":"var(--bg)"};color:${t.isDone?"var(--gd)":"var(--t3)"};">${t.isDone?"Done":"Pending"}</div>`;
+    rc.appendChild(row);
+  });
+  grid.appendChild(rc);
+
+  /* staff overview */
+  const sc2=sectionCard("Staff Overview");
+  if(!S.staff.length){sc2.appendChild(empty("No staff found"));}
+  else S.staff.slice(0,7).forEach(s=>{
+    const st=S.tasks.filter(t=>t.assignedTo===s.id);
+    const dn=st.filter(t=>t.isDone).length;
+    const p=st.length?Math.round(dn/st.length*100):0;
+    const row=h("div","display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--bd)");
+    row.innerHTML=`<div style="width:34px;height:34px;border-radius:50%;background:var(--gl);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:var(--gd);flex-shrink:0">${(s.email||"S")[0].toUpperCase()}</div>
+    <div style="flex:1;min-width:0">
+      <div style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tx)">${s.email}</div>
+      <div style="font-size:11px;color:var(--t3)">${st.length} task${st.length!==1?"s":""} · ${dn} done</div>
+    </div>
+    <div style="font-size:12px;font-weight:700;color:var(--g)">${p}%</div>`;
+    sc2.appendChild(row);
+  });
+  grid.appendChild(sc2);
+  frag.appendChild(grid);
+  const d=h("div","");d.appendChild(frag);return d;
+}
+
+/* all tasks */
+function vTasks(){
+  const wrap=h("div","");
+
+  /* filters */
+  const fb=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;gap:10px;flex-wrap:wrap");
+  fb.innerHTML=`<span style="font-size:13px;font-weight:500;color:var(--t2)">Filter:</span>`;
+
+  const mkSel=(opts,cur,cb)=>{
+    const sel=h("select","padding:7px 10px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:13px;color:var(--tx);background:#fff;cursor:pointer");
+    opts.forEach(([v,l])=>{const o=document.createElement("option");o.value=v;o.textContent=l;if(cur===v)o.selected=true;sel.appendChild(o);});
+    sel.onchange=()=>cb(sel.value);
+    return sel;
+  };
+
+  fb.appendChild(mkSel([["all","All Staff"],...S.staff.map(s=>[s.id,s.email])],S.fStaff,v=>{S.fStaff=v;R();}));
+  fb.appendChild(mkSel([["all","All Priorities"],["high","High"],["medium","Medium"],["low","Low"]],S.fPriority,v=>{S.fPriority=v;R();}));
+  fb.appendChild(mkSel([["all","All Status"],["pending","Pending"],["done","Completed"]],S.fStatus,v=>{S.fStatus=v;R();}));
+
+  const cnt=h("span","font-size:12px;color:var(--t3);margin-left:auto");
+  wrap.appendChild(fb);
+
+  let filtered=S.tasks;
+  if(S.fStaff!=="all")filtered=filtered.filter(t=>t.assignedTo===S.fStaff);
+  if(S.fPriority!=="all")filtered=filtered.filter(t=>t.priority===S.fPriority);
+  if(S.fStatus==="pending")filtered=filtered.filter(t=>!t.isDone);
+  if(S.fStatus==="done")filtered=filtered.filter(t=>t.isDone);
+
+  cnt.textContent=`${filtered.length} task${filtered.length!==1?"s":""}`;
+  fb.appendChild(cnt);
+
+  if(!filtered.length){
+    const e=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);padding:3rem;text-align:center");
+    e.innerHTML=`<svg width="40" height="40" viewBox="0 0 40 40" fill="none" style="margin:0 auto 12px;display:block"><rect width="40" height="40" rx="8" fill="var(--gl)"/><path d="M13 20h14M13 14h14M13 26h8" stroke="var(--gd)" stroke-width="2" stroke-linecap="round"/></svg>
+    <p style="color:var(--t3);font-size:14px">No tasks match the current filters.</p>`;
+    wrap.appendChild(e);
+  }else{
+    const list=h("div","display:flex;flex-direction:column;gap:10px");
+    filtered.forEach(t=>list.appendChild(taskRow(t)));
+    wrap.appendChild(list);
+  }
+  return wrap;
+}
+
+/* staff */
+function vStaff(){
+  const wrap=h("div","");
+  if(!S.staff.length){
+    const e=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);padding:3rem;text-align:center");
+    e.innerHTML=`<p style="color:var(--t3)">No staff found. Register staff in the Android app first, then reload this page.</p>`;
+    wrap.appendChild(e);return wrap;
+  }
+  const grid=h("div","display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:16px");
+  S.staff.forEach(s=>{
+    const st=S.tasks.filter(t=>t.assignedTo===s.id);
+    const dn=st.filter(t=>t.isDone).length;
+    const pend=st.length-dn;
+    const pct=st.length?Math.round(dn/st.length*100):0;
+
+    const card=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);padding:20px;transition:box-shadow .15s");
+    card.onmouseover=()=>card.style.boxShadow="var(--shm)";
+    card.onmouseout=()=>card.style.boxShadow="none";
+    card.innerHTML=`
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px">
+        <div style="width:44px;height:44px;border-radius:50%;background:var(--gl);display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;color:var(--gd)">${(s.email||"S")[0].toUpperCase()}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tx)">${s.email}</div>
+          <div style="font-size:12px;color:var(--t3)">Joined ${fmtDate(s.createdAt)}</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:16px">
+        ${mini("Total",st.length,"var(--tx)")}${mini("Done",dn,"var(--gd)")}${mini("Pending",pend,"var(--am)")}
+      </div>
+      <div style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+          <span style="font-size:12px;color:var(--t2)">Completion rate</span>
+          <span style="font-size:12px;font-weight:700;color:var(--gd)">${pct}%</span>
+        </div>
+        <div style="height:6px;background:var(--bd);border-radius:99px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:var(--g);border-radius:99px;transition:width .5s ease"></div>
+        </div>
+      </div>`;
+    const ab=h("button","width:100%;padding:9px;background:var(--gl);color:var(--gd);border-radius:var(--rs);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s");
+    ab.textContent="+ Assign Task";
+    ab.onmouseover=()=>{ab.style.background="var(--g)";ab.style.color="#fff";};
+    ab.onmouseout=()=>{ab.style.background="var(--gl)";ab.style.color="var(--gd)";};
+    ab.onclick=()=>{S.mForm.to=s.id;S.modal=true;R();};
+    card.appendChild(ab);
+    grid.appendChild(card);
+  });
+  wrap.appendChild(grid);
+  return wrap;
+}
+
+/* task row */
+function taskRow(t){
+  const c=pColor(t.priority||"medium");
+  const row=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);padding:16px 18px;display:flex;align-items:flex-start;gap:12px;transition:box-shadow .15s");
+  row.onmouseover=()=>row.style.boxShadow="var(--shm)";
+  row.onmouseout=()=>row.style.boxShadow="none";
+
+  const chk=document.createElement("input");
+  chk.type="checkbox";chk.checked=t.isDone;
+  chk.style.cssText="width:16px;height:16px;accent-color:var(--g);cursor:pointer;flex-shrink:0;margin-top:2px";
+  chk.onchange=()=>toggleDone(t.id,t.isDone);
+  row.appendChild(chk);
+
+  const dot=h("div",`width:9px;height:9px;border-radius:50%;background:${c.dot};flex-shrink:0;margin-top:4px`);
+  row.appendChild(dot);
+
+  const body=h("div","flex:1;min-width:0");
+  body.innerHTML=`
+    <div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:5px">
+      <span style="font-size:14px;font-weight:600;color:${t.isDone?"var(--t3)":"var(--tx)"};text-decoration:${t.isDone?"line-through":"none"}">${t.title}</span>
+      <span style="font-size:11px;padding:2px 8px;border-radius:99px;background:${c.bg};color:${c.tx};font-weight:600;text-transform:capitalize">${t.priority||"medium"}</span>
+      ${t.isDone?`<span style="font-size:11px;padding:2px 8px;border-radius:99px;background:var(--gl);color:var(--gd);font-weight:600">Completed</span>`:""}
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--t3)">
+      <span>Assigned to: <strong style="color:var(--t2);font-weight:500">${t.assignedToEmail||"—"}</strong></span>
+      ${t.patient?`<span>Patient: <strong style="color:var(--t2);font-weight:500">${t.patient}</strong></span>`:""}
+      <span>Created: ${fmtDate(t.createdAt)}</span>
+      ${t.createdBy?`<span>By: ${t.createdBy}</span>`:""}
+    </div>
+    ${t.notes?`<div style="margin-top:8px;font-size:12px;color:var(--t2);padding:7px 10px;background:var(--su2);border-radius:var(--rx);border-left:3px solid var(--bd2)">${t.notes}</div>`:""}`;
+  row.appendChild(body);
+
+  const db=h("button","width:32px;height:32px;border-radius:var(--rs);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--t3);transition:all .15s;flex-shrink:0");
+  db.innerHTML=`<svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M2 4h11M5 4V2.5h5V4M3 4l1 9h7l1-9M6 7v4M9 7v4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  db.onmouseover=()=>{db.style.background="#FEF0F0";db.style.color="var(--rd)";};
+  db.onmouseout=()=>{db.style.background="transparent";db.style.color="var(--t3)";};
+  db.onclick=()=>{S.confirmDel=t.id;R();};
+  row.appendChild(db);
+  return row;
+}
+
+/* ── task modal ── */
+function buildModal(){
+  const ov=h("div","position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:100;padding:1rem");
+  ov.onclick=e=>{if(e.target===ov){S.modal=false;S.mErr="";R();}};
+
+  const m=h("div","background:var(--su);border-radius:var(--r);padding:26px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto");
+
+  /* header */
+  const mh=h("div","display:flex;align-items:center;justify-content:space-between;margin-bottom:22px");
+  mh.innerHTML=`<h2 style="font-size:16px;font-weight:700;color:var(--tx)">Assign New Task</h2>`;
+  const xb=h("button","width:28px;height:28px;border-radius:50%;background:var(--bg);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--t2);font-size:18px;line-height:1");
+  xb.textContent="×";xb.onclick=()=>{S.modal=false;S.mErr="";R();};
+  mh.appendChild(xb);m.appendChild(mh);
+
+  if(S.mErr){
+    const er=h("div","background:#FEF0F0;border:1px solid #FECACA;color:#B91C1C;padding:10px 14px;border-radius:var(--rs);margin-bottom:16px;font-size:13px");
+    er.textContent=S.mErr;m.appendChild(er);
+  }
+
+  /* fields */
+  m.appendChild(mField("Task Title *","mTitle","text","e.g. Check vitals – Room 302",S.mForm.title,v=>S.mForm.title=v));
+  m.appendChild(mField("Patient Name (optional)","mPatient","text","e.g. John Doe",S.mForm.patient,v=>S.mForm.patient=v));
+
+  /* assign to */
+  const aw=h("div","margin-bottom:14px");
+  aw.innerHTML=`<label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">Assign To *</label>`;
+  const asel=h("select","width:100%;padding:10px 12px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:13px;color:var(--tx);background:#fff;cursor:pointer;transition:border-color .15s");
+  asel.onfocus=()=>asel.style.borderColor="var(--g)";
+  asel.onblur=()=>asel.style.borderColor="var(--bd2)";
+  const def=document.createElement("option");def.value="";def.textContent="Select staff member…";asel.appendChild(def);
+  S.staff.forEach(s=>{const o=document.createElement("option");o.value=s.id;o.textContent=s.email;if(S.mForm.to===s.id)o.selected=true;asel.appendChild(o);});
+  asel.onchange=()=>{S.mForm.to=asel.value;};
+  aw.appendChild(asel);m.appendChild(aw);
+
+  /* priority */
+  const pw=h("div","margin-bottom:16px");
+  pw.innerHTML=`<label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:8px">Priority</label>`;
+  const pr=h("div","display:flex;gap:8px");
+  ["high","medium","low"].forEach(p=>{
+    const c=pColor(p),active=S.mForm.priority===p;
+    const pb=h("button",`flex:1;padding:8px;border-radius:var(--rs);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;background:${active?c.bg:"var(--bg)"};color:${active?c.tx:"var(--t2)"};border:${active?`2px solid ${c.dot}`:"2px solid transparent"};text-transform:capitalize`);
+    pb.textContent=p;
+    pb.onclick=()=>{S.mForm.priority=p;R();};
+    pr.appendChild(pb);
+  });
+  pw.appendChild(pr);m.appendChild(pw);
+
+  /* notes */
+  const nw=h("div","margin-bottom:22px");
+  nw.innerHTML=`<label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">Notes (optional)</label>`;
+  const ta=h("textarea","width:100%;padding:10px 12px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:13px;color:var(--tx);background:#fff;resize:vertical;min-height:80px;transition:border-color .15s");
+  ta.placeholder="Additional instructions…";ta.value=S.mForm.notes||"";
+  ta.onfocus=()=>ta.style.borderColor="var(--g)";
+  ta.onblur=()=>ta.style.borderColor="var(--bd2)";
+  ta.oninput=()=>S.mForm.notes=ta.value;
+  nw.appendChild(ta);m.appendChild(nw);
+
+  /* actions */
+  const ac=h("div","display:flex;gap:10px");
+  const cn=h("button","flex:1;padding:11px;border-radius:var(--rs);font-size:14px;font-weight:600;background:var(--bg);color:var(--t2);cursor:pointer;transition:background .15s");
+  cn.textContent="Cancel";
+  cn.onmouseover=()=>cn.style.background="var(--bd)";
+  cn.onmouseout=()=>cn.style.background="var(--bg)";
+  cn.onclick=()=>{S.modal=false;S.mErr="";R();};
+
+  const sv=h("button",`flex:1;padding:11px;border-radius:var(--rs);font-size:14px;font-weight:600;background:var(--g);color:#fff;cursor:${S.mSaving?"not-allowed":"pointer"};opacity:${S.mSaving?.7:1};transition:background .15s`);
+  sv.textContent=S.mSaving?"Saving…":"Assign Task";
+  sv.onmouseover=()=>{if(!S.mSaving)sv.style.background="var(--gd)";};
+  sv.onmouseout=()=>sv.style.background="var(--g)";
+  sv.onclick=()=>{
+    if(S.mSaving)return;
+    S.mForm.title=q("mTitle")?.value||S.mForm.title;
+    S.mForm.patient=q("mPatient")?.value||S.mForm.patient;
+    S.mForm.to=asel.value;
+    S.mForm.notes=ta.value;
+    saveTask();
+  };
+  ac.appendChild(cn);ac.appendChild(sv);m.appendChild(ac);
+  ov.appendChild(m);return ov;
+}
+
+function mField(label,id,type,ph,val,cb){
+  const w=h("div","margin-bottom:14px");
+  w.innerHTML=`<label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">${label}</label>
+  <input id="${id}" type="${type}" placeholder="${ph}" value="${val||""}"
+    style="width:100%;padding:10px 12px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:13px;color:var(--tx);background:#fff;transition:border-color .15s"
+    onfocus="this.style.borderColor='var(--g)'" onblur="this.style.borderColor='var(--bd2)'"/>`;
+  setTimeout(()=>{const inp=q(id);if(inp)inp.oninput=()=>cb(inp.value);},10);
+  return w;
+}
+
+/* ── confirm delete ── */
+function buildConfirm(){
+  const ov=h("div","position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:200;padding:1rem");
+  const m=h("div","background:var(--su);border-radius:var(--r);padding:28px;width:100%;max-width:360px;text-align:center");
+  m.innerHTML=`
+    <div style="width:50px;height:50px;border-radius:50%;background:#FEF0F0;display:flex;align-items:center;justify-content:center;margin:0 auto 16px">
+      <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M11 8v5M11 15.5h.01M3 11a8 8 0 1016 0A8 8 0 003 11z" stroke="#DC3545" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </div>
+    <h3 style="font-size:16px;font-weight:700;margin-bottom:8px;color:var(--tx)">Delete this task?</h3>
+    <p style="font-size:14px;color:var(--t2);margin-bottom:24px;line-height:1.6">This cannot be undone. The task will be permanently removed from Firestore and the Android app.</p>`;
+  const row=h("div","display:flex;gap:10px");
+  const no=h("button","flex:1;padding:11px;border-radius:var(--rs);background:var(--bg);color:var(--t2);font-size:14px;font-weight:600;cursor:pointer");
+  no.textContent="Cancel";no.onclick=()=>{S.confirmDel=null;R();};
+  const yes=h("button","flex:1;padding:11px;border-radius:var(--rs);background:var(--rd);color:#fff;font-size:14px;font-weight:600;cursor:pointer");
+  yes.textContent="Delete";yes.onclick=()=>delTask(S.confirmDel);
+  row.appendChild(no);row.appendChild(yes);m.appendChild(row);
+  ov.appendChild(m);return ov;
+}
+
+/* ── toast ── */
+function buildToast(){
+  const cfg={success:{bg:"var(--g)",ic:"✓"},info:{bg:"var(--bl)",ic:"i"}}[S.toast.type]||{bg:"var(--g)",ic:"✓"};
+  const t=h("div",`position:fixed;bottom:24px;right:24px;background:${cfg.bg};color:#fff;padding:12px 18px;border-radius:var(--rs);font-size:14px;font-weight:500;z-index:300;display:flex;align-items:center;gap:8px;box-shadow:0 4px 20px rgba(0,0,0,0.15);animation:fadeIn .2s ease`);
+  t.innerHTML=`<span style="width:18px;height:18px;border-radius:50%;background:rgba(255,255,255,0.25);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700">${cfg.ic}</span>${S.toast.msg}`;
+  return t;
+}
+
+/* ── medicine stock ── */
+async function loadMedicines(){
+  try{
+    console.log("Loading medicines from Firestore...");
+    const snap=await getDocs(collection(db,"medicines"));
+    console.log("Snapshot docs count:",snap.docs.length);
+    S.medicines=snap.docs.map(d=>{
+      const data=d.data();
+      console.log("Medicine data:",data);
+      return {id:d.id,...data};
+    });
+    console.log("Loaded medicines:",S.medicines);
+    R();
+  }catch(e){
+    console.error("Error loading medicines:",e);
+    alert("Error loading medicines: "+e.message);
+  }
+}
+
+function buildMedicineTab(){
+  const container=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden");
+  if(!S.medicines.length){
+    const msg=h("div","padding:20px;text-align:center;color:var(--t3);font-size:13px");
+    msg.innerHTML=`<p style="color:var(--t2);margin-bottom:10px">No medicines found in Firestore collection 'medicines'.</p>
+    <p style="color:var(--t3);font-size:12px">Check browser console (F12) for debugging details.</p>
+    <p style="color:var(--t3);font-size:12px">Ensure your Firestore has a 'medicines' collection with 'medicine_name' and 'quantity' fields.</p>`;
+    container.appendChild(msg);
+    return container;
+  }
+  const table=h("table","width:100%;border-collapse:collapse");
+  const headerRow=h("tr","background:var(--su2);border-bottom:1px solid var(--bd)");
+  ["Medicine Name","Quantity","Threshold","Status"].forEach(text=>{
+    const th=h("th","padding:12px 14px;text-align:left;font-size:13px;font-weight:600;color:var(--tx);border-right:1px solid var(--bd)");
+    th.textContent=text;
+    headerRow.appendChild(th);
+  });
+  table.appendChild(headerRow);
+  S.medicines.forEach(med=>{
+    const row=h("tr","border-bottom:1px solid var(--bd)");
+    const quantity=med.quantity||0;
+    const threshold=med.low_stock_threshold||10;
+    let status="In Stock",statusColor="var(--g)";
+    if(quantity<threshold){status="Low Stock Alert";statusColor="var(--rd)";}else if(quantity<threshold*5){status="Restock Soon";statusColor="var(--am)";}
+    const cells=[med.medicine_name||"N/A",quantity,threshold,`<span style='color:${statusColor};font-weight:600'>${status}</span>`];
+    cells.forEach((text,idx)=>{
+      const td=h("td",`padding:12px 14px;border-right:1px solid var(--bd);font-size:13px;color:${idx===3?"":"var(--tx)"}`);
+      td.innerHTML=text;
+      row.appendChild(td);
+    });
+    table.appendChild(row);
+  });
+  container.appendChild(table);
+  return container;
+}
+
+/* ── shared components ── */
+function sectionCard(title){
+  const c=h("div","background:var(--su);border:1px solid var(--bd);border-radius:var(--r);padding:20px");
+  const hd=h("div","font-size:14px;font-weight:700;color:var(--tx);margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--bd)");
+  hd.textContent=title;c.appendChild(hd);return c;
+}
+const empty=t=>{const d=h("div","padding:20px;text-align:center;color:var(--t3);font-size:13px");d.textContent=t;return d;};
+const mini=(l,v,c)=>`<div style="background:var(--su2);border-radius:var(--rx);padding:8px;text-align:center"><div style="font-size:18px;font-weight:700;color:${c}">${v}</div><div style="font-size:11px;color:var(--t3)">${l}</div></div>`;
+
+/* ── icons ── */
+function logo(s){return`<svg width="${s}" height="${s}" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#1D9E75"/><path d="M20 10v20M10 20h20" stroke="white" stroke-width="3.5" stroke-linecap="round"/><circle cx="20" cy="20" r="6" stroke="white" stroke-width="2" fill="none" opacity="0.45"/></svg>`;}
+const icGrid=()=>`<svg width="15" height="15" viewBox="0 0 15 15" fill="none"><rect x="1" y="1" width="5.5" height="5.5" rx="1.5" stroke="currentColor" stroke-width="1.4"/><rect x="8.5" y="1" width="5.5" height="5.5" rx="1.5" stroke="currentColor" stroke-width="1.4"/><rect x="1" y="8.5" width="5.5" height="5.5" rx="1.5" stroke="currentColor" stroke-width="1.4"/><rect x="8.5" y="8.5" width="5.5" height="5.5" rx="1.5" stroke="currentColor" stroke-width="1.4"/></svg>`;
+const icCheck=()=>`<svg width="15" height="15" viewBox="0 0 15 15" fill="none"><path d="M4.5 7.5l2 2 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><rect x="1.5" y="1.5" width="12" height="12" rx="2.5" stroke="currentColor" stroke-width="1.4"/></svg>`;
+const icUsers=()=>`<svg width="15" height="15" viewBox="0 0 15 15" fill="none"><circle cx="7.5" cy="4.5" r="2.5" stroke="currentColor" stroke-width="1.4"/><path d="M2 13c0-3 2.5-4.5 5.5-4.5S13 10 13 13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+const icPill=()=>`<svg width="15" height="15" viewBox="0 0 15 15" fill="none"><circle cx="7.5" cy="4.5" r="2.5" stroke="currentColor" stroke-width="1.4"/><path d="M2 13c0-3 2.5-4.5 5.5-4.5S13 10 13 13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+const icLogout=()=>`<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5.5 2H3a1 1 0 00-1 1v8a1 1 0 001 1h2.5M9.5 9.5l3-2.5-3-2.5M12.5 7H5.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+</script>
+</body>
+</html>
