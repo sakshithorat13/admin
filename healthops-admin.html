@@ -4,6 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>HealthOps — Admin Portal</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -25,11 +26,13 @@ input,select,textarea{font-family:inherit;font-size:14px;outline:none}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 .ani{animation:fadeIn .2s ease}
+
 </style>
 </head>
 <body>
 <div id="root"></div>
 
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 <script type="module">
 import{initializeApp}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import{getAuth,signInWithEmailAndPassword,signOut,onAuthStateChanged}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
@@ -71,9 +74,11 @@ let S={
   user:null,role:null,staff:[],tasks:[],medicines:[],resources:[],
   loading:true,authLoading:false,loginErr:"",
   view:"dashboard",
-  modal:false,mForm:{title:"",to:"",patient:"",priority:"medium",notes:""},mErr:"",mSaving:false,
+  modal:false,mForm:{title:"",to:"",patient:"",priority:"medium",notes:"",locationName:""},mErr:"",mSaving:false,
   fStaff:"all",fPriority:"all",fStatus:"all",
   toast:null,confirmDel:null,
+  showMapModal:false,selectedLatLng:null,mapInstance:null,mapMarker:null,mapCircle:null,
+  locations: [],
 };
 let unsubTasks=null;
 const R=()=>{const root=document.getElementById("root");root.innerHTML="";root.appendChild(build());};
@@ -91,6 +96,7 @@ onAuthStateChanged(auth,async user=>{
     }else{
       S.user=user;S.loginErr="";
       await loadStaff();
+      await loadLocations();
       subscribeToTasks();
       S.loading=false;
     }
@@ -128,9 +134,10 @@ function subscribeToTasks(){
   });
 }
 async function saveTask(){
-  const{title,to,patient,priority,notes}=S.mForm;
+  const{title,to,patient,priority,notes,locationName}=S.mForm;
   if(!title.trim()){S.mErr="Task title is required.";R();return;}
   if(!to){S.mErr="Please select a staff member.";R();return;}
+  if(!locationName){S.mErr="Please select a location.";R();return;}
   const sm=S.staff.find(s=>s.id===to);
   S.mSaving=true;S.mErr="";R();
   try{
@@ -138,12 +145,13 @@ async function saveTask(){
       title:title.trim(),assignedTo:to,
       assignedToEmail:sm?.email||"",
       patient:patient.trim(),priority,
-      notes:notes.trim(),isDone:false,
+      notes:notes.trim(),locationName,
+      isDone:false,
       createdAt:serverTimestamp(),
       createdBy:S.user.email,
     });
     S.modal=false;
-    S.mForm={title:"",to:"",patient:"",priority:"medium",notes:""};
+    S.mForm={title:"",to:"",patient:"",priority:"medium",notes:"",locationName:""};
     toast("Task assigned successfully!","success");
   }catch(e){S.mErr="Failed: "+e.message;}
   S.mSaving=false;R();
@@ -160,7 +168,17 @@ function toast(msg,type="success"){
   S.toast={msg,type};R();
   setTimeout(()=>{S.toast=null;R();},3000);
 }
+async function loadLocations(){
+  const snap = await getDocs(collection(db,"hospital_locations"));
+  S.locations = snap.docs.map(d => ({id:d.id, ...d.data()}));
+  R();
+}
 
+async function addLocation(loc){
+  await addDoc(collection(db,"hospital_locations"), loc);
+  toast("Location added!","success");
+  loadLocations();
+}
 /* ─── builder ─────────────────────────────────── */
 function build(){
   if(S.loading)return buildLoading();
@@ -265,6 +283,7 @@ function buildApp(){
   main.appendChild(content);
   w.appendChild(main);
   if(S.modal)w.appendChild(buildModal());
+  if(S.showMapModal)w.appendChild(buildMapModal());
   if(S.confirmDel)w.appendChild(buildConfirm());
   if(S.toast)w.appendChild(buildToast());
   return w;
@@ -287,7 +306,9 @@ function buildSidebar(){
     {id:"tasks",ic:icCheck(),lb:"All Tasks"},
     {id:"staff",ic:icUsers(),lb:"Staff Members"},
     {id:"medicine",ic:icPill(),lb:"Medicine Stock"},
-    {id:"resources",ic:icBed(),lb:"Resources"}
+    {id:"resources",ic:icBed(),lb:"Resources"},
+    {id:"locations",ic:icBed(),lb:"Hospital Locations"}
+
   ].forEach(({id,ic,lb})=>{
     const active=S.view===id;
     const btn=h("button",`width:100%;display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--rs);margin-bottom:2px;font-size:14px;font-weight:500;transition:all .15s;text-align:left;background:${active?"rgba(255,255,255,0.13)":"transparent"};color:${active?"#fff":"rgba(255,255,255,0.55)"}`);
@@ -297,6 +318,7 @@ function buildSidebar(){
     btn.onmouseout=()=>{if(!active)btn.style.background="transparent";};
     btn.onclick=()=>{
       S.view=id;
+      if(id==="locations") loadLocations();
       if (id === "medicine") loadMedicines(); // Ensure loadMedicines is called
       if (id === "resources") loadResources(); // Ensure loadResources is called
       R();
@@ -346,6 +368,7 @@ function buildView(){
   else if(S.view==="staff")w.appendChild(vStaff());
   else if(S.view==="medicine")w.appendChild(buildMedicineTab());
   else if(S.view==="resources")w.appendChild(buildResourcesTab());
+  else if(S.view==="locations") w.appendChild(buildLocationsTab());
   return w;
 }
 
@@ -585,6 +608,23 @@ function buildModal(){
   asel.onchange=()=>{S.mForm.to=asel.value;};
   aw.appendChild(asel);m.appendChild(aw);
 
+  const lw=h("div","margin-bottom:14px");
+  lw.innerHTML=`<label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">Select Location *</label>`;
+  const lsel=h("select","width:100%;padding:10px 12px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:13px;color:var(--tx);background:#fff;cursor:pointer;transition:border-color .15s");
+  lsel.id="locationDropdown";
+  lsel.onfocus=()=>lsel.style.borderColor="var(--g)";
+  lsel.onblur=()=>lsel.style.borderColor="var(--bd2)";
+  const ldef=document.createElement("option");ldef.value="";ldef.textContent="Choose location";lsel.appendChild(ldef);
+  S.locations.forEach(loc=>{
+    const o=document.createElement("option");
+    o.value=loc.name;
+    o.textContent=loc.name;
+    if(S.mForm.locationName===loc.name)o.selected=true;
+    lsel.appendChild(o);
+  });
+  lsel.onchange=()=>{S.mForm.locationName=lsel.value;};
+  lw.appendChild(lsel);m.appendChild(lw);
+
   /* priority */
   const pw=h("div","margin-bottom:16px");
   pw.innerHTML=`<label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:8px">Priority</label>`;
@@ -626,6 +666,7 @@ function buildModal(){
     S.mForm.patient=q("mPatient")?.value||S.mForm.patient;
     S.mForm.to=asel.value;
     S.mForm.notes=ta.value;
+    S.mForm.locationName=q("locationDropdown")?.value||S.mForm.locationName;
     saveTask();
   };
   ac.appendChild(cn);ac.appendChild(sv);m.appendChild(ac);
@@ -858,6 +899,131 @@ function buildMedicineTab(){
   });
   container.appendChild(table);
   return container;
+}
+function buildLocationsTab(){
+  const wrap = h("div","");
+
+  const btn = h("button","padding:10px 16px;background:var(--g);color:#fff;border-radius:8px;margin-bottom:16px");
+  btn.textContent = "+ Add Location";
+
+  btn.onclick = () => {
+    S.selectedLatLng = null;
+    S.showMapModal = true;
+    R();
+  };
+
+  wrap.appendChild(btn);
+
+  if(!S.locations || S.locations.length===0){
+    const msg = h("div","color:var(--t3);font-size:14px");
+    msg.textContent = "No locations added yet.";
+    wrap.appendChild(msg);
+    return wrap;
+  }
+
+  S.locations.forEach(loc=>{
+    const card = h("div","padding:12px;border:1px solid var(--bd);border-radius:8px;margin-bottom:10px;background:#fff");
+    card.innerHTML = `
+      <strong>${loc.name}</strong><br/>
+      Lat: ${loc.lat} | Lng: ${loc.lng}<br/>
+      Radius: ${loc.radius} meters
+    `;
+    wrap.appendChild(card);
+  });
+
+  return wrap;
+}
+
+function buildMapModal(){
+  const ov=h("div","position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:250;padding:1rem");
+  ov.onclick=e=>{if(e.target===ov){S.showMapModal=false;R();}};
+
+  const m=h("div","background:var(--su);border-radius:var(--r);padding:26px;width:100%;max-width:540px;max-height:90vh;overflow-y:auto");
+  const mh=h("div","display:flex;align-items:center;justify-content:space-between;margin-bottom:18px");
+  mh.innerHTML=`<h2 style="font-size:16px;font-weight:700;color:var(--tx)">Add Hospital Location</h2>`;
+  const xb=h("button","width:28px;height:28px;border-radius:50%;background:var(--bg);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--t2);font-size:18px;line-height:1");
+  xb.textContent="×";xb.onclick=()=>{S.showMapModal=false;R();};
+  mh.appendChild(xb);m.appendChild(mh);
+
+  const content=h("div","");
+  content.innerHTML=`
+    <div style="margin-bottom:14px">
+      <label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">Hospital Name</label>
+      <input id="locName" type="text" placeholder="e.g. City Hospital"
+        style="width:100%;padding:10px 12px;border:1.5px solid var(--bd2);border-radius:var(--rs);font-size:14px;color:var(--tx);background:#fff;transition:border-color .15s"
+        onfocus="this.style.borderColor='var(--g)'" onblur="this.style.borderColor='var(--bd2)'"/>
+    </div>
+    <div style="margin-bottom:14px">
+      <label style="display:block;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:6px">Select location on map</label>
+      <div id="map" style="width:100%;height:300px;border:1px solid var(--bd);border-radius:var(--rs);overflow:hidden;background:#f7faf8"></div>
+    </div>
+    <div style="margin-bottom:22px">
+      <label style="display:flex;align-items:center;justify-content:space-between;font-size:13px;font-weight:500;color:var(--t2);margin-bottom:8px">
+        <span>Radius (meters)</span><span id="radiusVal">200m</span>
+      </label>
+      <input id="radius" type="range" min="50" max="1000" value="200" style="width:100%;accent-color:var(--g)" />
+    </div>
+  `;
+  m.appendChild(content);
+
+  const actions=h("div","display:flex;gap:10px");
+  const cancel=h("button","flex:1;padding:11px;border-radius:var(--rs);background:var(--bg);color:var(--t2);font-size:14px;font-weight:600;cursor:pointer;transition:background .15s");
+  cancel.textContent="Cancel";
+  cancel.onmouseover=()=>cancel.style.background="var(--bd)";
+  cancel.onmouseout=()=>cancel.style.background="var(--bg)";
+  cancel.onclick=()=>{S.showMapModal=false;R();};
+
+  const save=h("button","flex:1;padding:11px;border-radius:var(--rs);background:var(--g);color:#fff;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s");
+  save.textContent="Save Location";
+  save.onmouseover=()=>save.style.background="var(--gd)";
+  save.onmouseout=()=>save.style.background="var(--g)";
+  save.onclick=()=>{
+    const name=q("locName")?.value.trim();
+    const radius=parseInt(q("radius")?.value||"200",10);
+    const sel=S.selectedLatLng;
+    if(!name){alert("Hospital name is required.");return;}
+    if(!sel){alert("Please select a location on the map.");return;}
+    addLocation({name,lat:sel.lat,lng:sel.lng,radius});
+    S.showMapModal=false;S.selectedLatLng=null;
+    if(S.mapInstance){S.mapInstance.remove();S.mapInstance=null;S.mapMarker=null;S.mapCircle=null;}
+    R();
+  };
+
+  actions.appendChild(cancel);actions.appendChild(save);m.appendChild(actions);
+  ov.appendChild(m);
+  setTimeout(initMap,100);
+  return ov;
+}
+
+function initMap(){
+  const mapContainer=q("map");
+  if(!mapContainer)return;
+  if(S.mapInstance){S.mapInstance.remove();S.mapInstance=null;S.mapMarker=null;S.mapCircle=null;}
+  const map=L.map("map").setView([19.0760,72.8777],12);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{
+    attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  S.mapInstance=map;
+  const radiusInput=q("radius");
+  const radiusLabel=q("radiusVal");
+  const updateCircle=()=>{
+    const radius=Number(radiusInput?.value||200);
+    if(radiusLabel)radiusLabel.textContent=`${radius}m`;
+    if(S.mapCircle)S.mapCircle.setRadius(radius);
+  };
+  map.on("click",e=>{
+    S.selectedLatLng=e.latlng;
+    if(S.mapMarker)S.mapMarker.remove();
+    if(S.mapCircle)S.mapCircle.remove();
+    S.mapMarker=L.marker(e.latlng).addTo(map);
+    S.mapCircle=L.circle(e.latlng,{radius:Number(radiusInput?.value||200),color:"#1D9E75",fillColor:"rgba(29,158,117,0.18)",fillOpacity:0.35}).addTo(map);
+  });
+  if(radiusInput){
+    radiusInput.oninput=()=>{
+      updateCircle();
+    };
+  }
+  updateCircle();
 }
 
 /* ── shared components ── */
